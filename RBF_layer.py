@@ -1,82 +1,125 @@
 import numpy as np
 import load_data
 import tensorflow as tf
+from scipy.stats import norm
 from tensorflow import Session as sess
-from keras import Sequential
-from keras import activations, initializers, regularizers, constraints
-
-from keras import backend as K
-from keras.engine.topology import Layer, InputSpec
 from keras.layers import Dense, Activation
+from keras.engine import Layer
+from keras.engine import InputSpec
+from keras import activations
+from keras import initializers
+from keras import regularizers
+from keras import constraints
+from keras import backend as K
+from tensorflow.contrib.learn import KMeansClustering as tf_kmeans
 
-def RBF_gauss_euclidean(x,c,sigma):
-        #sample x number = N, center bumber = M, x dim = center dim = input_dim
-        input_dim = x.shape[1]
-        N = x.shape[0]
-        M = c.shape[0]
-	print x.shape
-        M_for_eye = tf.cast(M, tf.int32)
-        center_element_num = M*input_dim
-	print M
-        #(x-c)^2, output size:NxM
-        #[(x1-c1)^2, (x1-c2)^2, ...]
-        #[(x2-c1)^2, (x2-c2)^2, ...]
-        c = tf.reshape(c,[1,center_element_num])
-	print c
-        c_mat = tf.tile(c,[N,1])
-        x_mat = tf.tile(x,[1,M])
-        element_x_sub_c_square_mat = tf.square(x_mat-c_mat)
+def k_means(inputs, k_num):
+    kms = tf_kmeans(k_num,initial_clusters='kmeans_plus_plus')
+    def input_for_kmeans():
+        data = tf.constant(inputs, dtype=tf.float32)
+        return (data,None)
+    kms.fit(input_fn=input_for_kmeans,max_steps=100)
+    return kms.clusters()
 
-        I_mat = tf.eye(M_for_eye)
-        element_merge_mat = tf.tile(I_mat,[1,input_dim])
-        element_merge_mat = tf.reshape(element_merge_mat,[input_dim*M,M])
-        merge_x_sub_c_square_mat = K.dot(element_x_sub_c_square_mat,element_merge_mat)
-        dist_mat = tf.sqrt(merge_x_sub_c_square_mat)
-        gauss = pdf.Normal(loc=0., scale=sigma)
-        output = gauss.prob(dist_mat)
+def max_one(inputs):
+    tf_inputs = tf.constant(inputs,dtype=tf.float32)
+    the_max = tf.reduce_max(tf_inputs,axis=0)
+    output = tf.where(tf.cast(the_max,dtype=tf.bool), the_max, tf.fill(the_max.shape,0.0000000001))
+    return output
+
+
+class rbfn(Layer):
+    def __init__(self, units,
+                 hidden_centers,
+                 norm_mat,
+                 delta = 0.1,
+                 activation=None,
+                 use_bias=False,
+                 kernel_initializer='glorot_uniform',
+                 bias_initializer='zeros',
+                 kernel_regularizer=None,
+                 bias_regularizer=None,
+                 activity_regularizer=None,
+                 kernel_constraint=None,
+                 bias_constraint=None,
+                 **kwargs):
+        if 'input_shape' not in kwargs and 'input_dim' in kwargs:
+            kwargs['input_shape'] = (kwargs.pop('input_dim'),)
+        self.units = units
+        self.hidden_centers = hidden_centers
+        self.delta = delta
+        self.norm_mat = norm_mat
+        self.activation = activations.get(activation)
+        self.use_bias = use_bias
+        self.kernel_initializer = initializers.get(kernel_initializer)
+        self.bias_initializer = initializers.get(bias_initializer)
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+        self.bias_regularizer = regularizers.get(bias_regularizer)
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        self.kernel_constraint = constraints.get(kernel_constraint)
+        self.bias_constraint = constraints.get(bias_constraint)
+        self.input_spec = InputSpec(min_ndim=2)
+        self.supports_masking = True
+        super(rbfn, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        assert len(input_shape) >= 2
+        input_dim = input_shape[-1]
+        center_num = self.hidden_centers.shape[0]
+        self.kernel = self.add_weight(shape=(center_num, self.units),
+                                      initializer=self.kernel_initializer,
+                                      name='kernel',
+                                      regularizer=self.kernel_regularizer,
+                                      constraint=self.kernel_constraint)
+        if self.use_bias:
+            self.bias = self.add_weight(shape=(self.units,),
+                                        initializer=self.bias_initializer,
+                                        name='bias',
+                                        regularizer=self.bias_regularizer,
+                                        constraint=self.bias_constraint)
+        else:
+            self.bias = None
+        self.input_spec = InputSpec(min_ndim=2, axes={-1: input_dim})
+        self.built = True
+
+    def RBFunction(x, h_centers, delta, norm_mat):
+        c = tf.divide(h_centers, norm_mat)
+        x = tf.divide(x, norm_mat )
+        e_c = tf.expand_dims(c, 0 )
+        e_x = tf.expand_dims(x, 1 )
+        return tf.exp( -delta * tf.sqrt(tf.reduce_sum(tf.square(tf.subtract(e_c, e_x)), 2 )))
+
+    def call(self, inputs):
+        def RBFunction(x, h_centers, delta, norm_mat):
+            c = tf.divide(h_centers, norm_mat)
+            x = tf.divide(x, norm_mat )
+            e_c = tf.expand_dims(c, 0 )
+            e_x = tf.expand_dims(x, 1 )
+            return tf.exp( -delta * tf.sqrt(tf.reduce_sum(tf.square(tf.subtract(e_c, e_x)), 2 )))
+
+        output = K.dot(RBFunction(inputs,self.hidden_centers,self.delta, self.norm_mat),self.kernel)
         return output
 
-class rbf(Layer):
-	def __init__(self, units, activation=None,
-		kernel_initializer='glorot_uniform',
-		kernel_regularizer=None, activity_regularizer=None,
-		kernel_constraint=None,
-		**kwargs):
-		self.kernel_initializer = initializers.get(kernel_initializer)
-                self.kernel_regularizer = regularizers.get(kernel_regularizer)
-                self.activity_regularizer = regularizers.get(activity_regularizer)
-                self.kernel_constraint = constraints.get(kernel_constraint)
-		self.units = units
-		#self.input_shape = input_shape
-		self.center_num = units
-		super(rbf, self).__init__(**kwargs)
-	def build(self, input_shape):
-        	# Create a trainable weight variable for this layer.
-		input_dim = input_shape[-1]
-		print input_shape
-		
-		self.centers = self.add_weight(shape=(self.center_num, input_dim),
-				initializer=self.kernel_initializer,
-				name='centers',
-				regularizer=self.kernel_regularizer,
-				constraint=self.kernel_constraint)
+    def compute_output_shape(self, input_shape):
+        assert input_shape and len(input_shape) >= 2
+        assert input_shape[-1]
+        output_shape = list(input_shape)
+        output_shape[-1] = self.units
+        return tuple(output_shape)
 
-		self.sigmas = self.add_weight(shape=(1, self.center_num),
-                                initializer=self.kernel_initializer,
-                                name='sigmas',
-                                regularizer=self.kernel_regularizer,
-                                constraint=self.kernel_constraint)
+    def get_config(self):
+        config = {
+            'units': self.units,
+            'activation': activations.serialize(self.activation),
+            'use_bias': self.use_bias,
+            'kernel_initializer': initializers.serialize(self.kernel_initializer),
+            'bias_initializer': initializers.serialize(self.bias_initializer),
+            'kernel_regularizer': regularizers.serialize(self.kernel_regularizer),
+            'bias_regularizer': regularizers.serialize(self.bias_regularizer),
+            'activity_regularizer': regularizers.serialize(self.activity_regularizer),
+            'kernel_constraint': constraints.serialize(self.kernel_constraint),
+            'bias_constraint': constraints.serialize(self.bias_constraint)
+        }
+        base_config = super(rbf, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
-		super(rbf, self).build(input_shape)
-		# Be sure to call this somewhere!
-
-	def call(self, inputs):
-		output = RBF_gauss_euclidean(inputs,self.centers,self.sigmas)
-		return output
-
-	def compute_output_shape(self, input_shape):
-		output_shape = list(input_shape)
-		output_shape[-1] = self.output_dim
-		#sess.run(output_shape)
-		print output_shape
-		return tuple(output_shape)	
